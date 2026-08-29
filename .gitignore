@@ -1,0 +1,15 @@
+# 3D / data files
+*.stl
+*.STL
+
+*.json
+*.JSON
+
+*.txt
+*.TXT
+
+*.obj
+*.OBJ
+
+*.3mf
+*.3MF
