@@ -34,7 +34,7 @@ import shapely
 from shapely.geometry import Point, Polygon, LineString
 from shapely.ops import unary_union
 
-VERSION = "2.3"
+VERSION = "2.5"
 
 PRESETS = {
     "subtle": dict(
@@ -148,6 +148,13 @@ class Config:
     skip_bottom: bool = True
     bottom_tolerance: float = 0.60
     bottom_normal_angle_deg: float = 20.0
+
+    # Thin-wall protection
+    min_wall_thickness: float = 1.20
+    thickness_safety: float = 0.10
+    thickness_probe_max: float = 20.0
+    thickness_ray_epsilon: float = 0.03
+    thickness_mode: str = "skip"  # skip | clamp
 
     # Local remeshing
     surface_resolution: float = 1.5
@@ -281,7 +288,7 @@ def ask_choice(label, choices, default):
 def wizard(cfg):
     print()
     print("="*72)
-    print(" STL FLAT-SURFACE METAL TEXTURER V2.3")
+    print(" STL FLAT-SURFACE METAL TEXTURER V2.5")
     print("="*72)
     print("V2 directly deforms only selected flat patches.")
     print("It does NOT Boolean/rebuild the whole model.")
@@ -320,6 +327,35 @@ def wizard(cfg):
             cfg.bottom_normal_angle_deg,
             0.0,
         )
+
+    print("\nThin-wall protection:")
+    protect_thin = ask_yes_no(
+        "  Protect areas that would become too thin?",
+        cfg.min_wall_thickness > 0,
+    )
+    if protect_thin:
+        cfg.min_wall_thickness = ask_float(
+            "  Minimum RESULTING wall thickness (mm)",
+            cfg.min_wall_thickness,
+            0.01,
+        )
+        cfg.thickness_safety = ask_float(
+            "  Extra thickness safety margin (mm)",
+            cfg.thickness_safety,
+            0.0,
+        )
+        cfg.thickness_probe_max = ask_float(
+            "  Maximum thickness probe distance (mm)",
+            cfg.thickness_probe_max,
+            0.1,
+        )
+        cfg.thickness_mode = ask_choice(
+            "  If a proposed dent would breach the minimum:",
+            ["skip", "clamp"],
+            cfg.thickness_mode,
+        )
+    else:
+        cfg.min_wall_thickness = 0.0
 
     print("\nLocal surface mesh:")
     cfg.surface_resolution = ask_float("  Desired maximum triangle edge (mm)", cfg.surface_resolution, 0.1)
@@ -433,6 +469,37 @@ def build_parser():
         help="Maximum tilt away from horizontal for a lowest-Z patch to count as bottom.",
     )
 
+    p.add_argument(
+        "--min-wall-thickness",
+        type=float,
+        help="Minimum allowed RESULTING wall thickness in mm. 0 disables thin-wall protection.",
+    )
+    p.add_argument(
+        "--thickness-safety",
+        type=float,
+        help="Extra safety margin added to the minimum wall thickness.",
+    )
+    p.add_argument(
+        "--thickness-probe-max",
+        type=float,
+        help="Maximum inward ray distance used to search for the opposite wall.",
+    )
+    p.add_argument(
+        "--thickness-ray-epsilon",
+        type=float,
+        help="Small inward ray offset in mm to avoid self-hits.",
+    )
+    p.add_argument(
+        "--thickness-mode",
+        choices=["skip", "clamp"],
+        help="skip = leave unsafe vertices unchanged; clamp = reduce dent depth to stay above minimum.",
+    )
+    p.add_argument(
+        "--no-thickness-protection",
+        action="store_true",
+        help="Disable minimum-wall-thickness protection.",
+    )
+
     p.add_argument("--surface-resolution", type=float)
     p.add_argument("--max-new-triangles", type=int)
     p.add_argument("--max-depth", type=float)
@@ -481,6 +548,9 @@ def apply_args(cfg,args):
             v = getattr(args,name)
             if v is not None and name not in ("input","output","seed"):
                 setattr(cfg,name,v)
+
+    if getattr(args, "no_thickness_protection", False):
+        cfg.min_wall_thickness = 0.0
 
     if args.no_report:
         cfg.write_report=False
@@ -941,6 +1011,220 @@ def auto_resolution(cfg,eligible):
     return max(cfg.surface_resolution,budget_edge)
 
 
+
+def build_thickness_intersector(mesh, cfg):
+    """
+    Build a trimesh ray intersector when thin-wall protection is enabled.
+
+    trimesh's pure-Python triangle ray intersector uses the `rtree` package
+    for spatial indexing. We fail loudly rather than silently disabling wall
+    protection.
+    """
+    if cfg.min_wall_thickness <= 0:
+        return None
+
+    try:
+        import rtree  # noqa: F401
+    except ImportError:
+        raise RuntimeError(
+            "Thin-wall protection is enabled, but Python package 'rtree' is missing.\\n"
+            "Install it with:\\n"
+            "    pip install rtree\\n"
+            "Then run the program again.\\n"
+            "Or use --no-thickness-protection to run without this safety check."
+        )
+
+    from trimesh.ray.ray_triangle import RayMeshIntersector
+    return RayMeshIntersector(mesh)
+
+
+def measure_wall_thickness(points, direction, source_face_ids, mesh, intersector, cfg):
+    """
+    Measure local wall thickness in the deformation direction.
+
+    Returns both the thickness and the original-mesh face which was hit.
+    Knowing the opposing face lets us detect when BOTH sides of the same thin
+    wall are eligible for texturing.
+    """
+    count = len(points)
+    if count == 0:
+        return np.empty(0, dtype=float), np.empty(0, dtype=np.int64)
+
+    direction = np.asarray(direction, dtype=float)
+    dl = np.linalg.norm(direction)
+    if dl <= 1e-12:
+        return (
+            np.full(count, np.inf, dtype=float),
+            np.full(count, -1, dtype=np.int64),
+        )
+    direction = direction / dl
+
+    eps = max(1e-6, cfg.thickness_ray_epsilon)
+    origins = np.asarray(points, dtype=float) + direction[None, :] * eps
+    directions = np.repeat(direction[None, :], count, axis=0)
+
+    try:
+        locations, ray_ids, tri_ids = intersector.intersects_location(
+            origins,
+            directions,
+            multiple_hits=True,
+        )
+    except ModuleNotFoundError as e:
+        if e.name == "rtree":
+            raise RuntimeError(
+                "Thin-wall protection needs Python package 'rtree'.\n"
+                "Install it with: pip install rtree"
+            ) from e
+        raise
+
+    result = np.full(count, np.inf, dtype=float)
+    hit_face = np.full(count, -1, dtype=np.int64)
+    if len(ray_ids) == 0:
+        return result, hit_face
+
+    ray_ids = np.asarray(ray_ids, dtype=np.int64)
+    tri_ids = np.asarray(tri_ids, dtype=np.int64)
+    locations = np.asarray(locations, dtype=float)
+
+    source_mask = np.zeros(len(mesh.faces), dtype=bool)
+    source_mask[np.asarray(source_face_ids, dtype=np.int64)] = True
+
+    vec = locations - origins[ray_ids]
+    distances = np.einsum("ij,j->i", vec, direction) + eps
+
+    valid = (
+        (distances > eps * 0.5)
+        & (distances <= cfg.thickness_probe_max)
+        & (~source_mask[tri_ids])
+    )
+    if not np.any(valid):
+        return result, hit_face
+
+    vr = ray_ids[valid]
+    vd = distances[valid]
+    vt = tri_ids[valid]
+
+    # Sort by ray then distance; first item for a ray is its nearest hit.
+    order = np.lexsort((vd, vr))
+    vr = vr[order]
+    vd = vd[order]
+    vt = vt[order]
+
+    first = np.ones(len(vr), dtype=bool)
+    if len(vr) > 1:
+        first[1:] = vr[1:] != vr[:-1]
+
+    chosen_r = vr[first]
+    result[chosen_r] = vd[first]
+    hit_face[chosen_r] = vt[first]
+    return result, hit_face
+
+
+def apply_thickness_protection(depths, points, direction, source_face_ids,
+                               mesh, intersector, cfg, source_face_labels):
+    """
+    Enforce minimum RESULTING wall thickness.
+
+    Important safety case:
+    if the opposing wall face is ALSO an eligible textured flat patch, both
+    sides may be pushed inward independently.
+
+    Example:
+        original wall = 1.5 mm
+        protected min = 1.3 mm
+        available     = 0.2 mm
+
+    It is NOT safe to let each side independently use 0.2 mm. That could remove
+    0.4 mm in total and create a hole.
+
+    For an opposing textured face, each side therefore receives HALF of the
+    available budget. For a non-textured opposing face, the current side may
+    use the full budget.
+
+    skip:
+        unsafe deformation is set to zero.
+
+    clamp:
+        unsafe deformation is reduced to the safe limit.
+    """
+    stats = {
+        "rays": 0,
+        "hits": 0,
+        "opposing_textured_hits": 0,
+        "protected_vertices": 0,
+        "clamped_vertices": 0,
+        "min_measured_thickness": None,
+        "min_resulting_thickness": None,
+    }
+
+    if cfg.min_wall_thickness <= 0 or intersector is None:
+        return depths, stats
+
+    active = np.flatnonzero(depths > 1e-8)
+    if len(active) == 0:
+        return depths, stats
+
+    thickness, hit_face = measure_wall_thickness(
+        np.asarray(points)[active],
+        direction,
+        source_face_ids,
+        mesh,
+        intersector,
+        cfg,
+    )
+
+    finite = np.isfinite(thickness)
+    stats["rays"] = int(len(active))
+    stats["hits"] = int(np.count_nonzero(finite))
+
+    if np.any(finite):
+        stats["min_measured_thickness"] = float(np.min(thickness[finite]))
+
+    labels = np.asarray(source_face_labels, dtype=np.int64)
+    opposing_textured = np.zeros(len(active), dtype=bool)
+    valid_face = finite & (hit_face >= 0) & (hit_face < len(labels))
+    if np.any(valid_face):
+        opposing_textured[valid_face] = labels[hit_face[valid_face]] >= 0
+
+    stats["opposing_textured_hits"] = int(np.count_nonzero(opposing_textured))
+
+    required = cfg.min_wall_thickness + cfg.thickness_safety
+    proposed = depths[active].copy()
+    result_depth = proposed.copy()
+
+    available_total = np.maximum(0.0, thickness - required)
+    safe_limit = available_total.copy()
+
+    # Reserve the other half of the material budget for damage coming from the
+    # opposite textured surface.
+    safe_limit[opposing_textured] *= 0.5
+
+    unsafe = finite & (proposed > safe_limit + 1e-12)
+
+    if cfg.thickness_mode == "clamp":
+        changed = unsafe & (safe_limit < result_depth)
+        result_depth[changed] = safe_limit[changed]
+        stats["clamped_vertices"] = int(np.count_nonzero(changed))
+        stats["protected_vertices"] = int(
+            np.count_nonzero(changed & (safe_limit <= 1e-8))
+        )
+    else:
+        result_depth[unsafe] = 0.0
+        stats["protected_vertices"] = int(np.count_nonzero(unsafe))
+
+    depths = depths.copy()
+    depths[active] = result_depth
+
+    if np.any(finite):
+        remaining = thickness.copy()
+        remaining[finite] -= result_depth[finite]
+        two_sided = finite & opposing_textured
+        remaining[two_sided] -= result_depth[two_sided]
+        stats["min_resulting_thickness"] = float(np.min(remaining[finite]))
+
+    return depths, stats
+
+
 def _edge_key(a,b):
     a=int(a); b=int(b)
     return (a,b) if a<b else (b,a)
@@ -1037,7 +1321,7 @@ def conforming_refine(vertices,faces,labels,max_edge,max_iter,max_total_faces):
     return vertices,faces,labels
 
 
-def texture_refined_mesh(vertices,faces,labels,patch_by_id,cfg,rng):
+def texture_refined_mesh(vertices,faces,labels,patch_by_id,cfg,rng,source_mesh,thickness_intersector,source_face_labels):
     """
     Move vertices inward only on eligible planar faces.
     Patch boundary vertices stay exactly fixed because the procedural field
@@ -1092,7 +1376,19 @@ def texture_refined_mesh(vertices,faces,labels,patch_by_id,cfg,rng):
                 continue
             depths[i]=local_depth(float(x),float(y),p,cfg,ev,float(fade[i]))
 
-        out[vids]-=depths[:,None]*p["n"][None,:]
+        deform_direction = -p["n"]
+        depths, thickness_stats = apply_thickness_protection(
+            depths,
+            out[vids],
+            deform_direction,
+            p["faces"],
+            source_mesh,
+            thickness_intersector,
+            cfg,
+            source_face_labels,
+        )
+
+        out[vids]+=depths[:,None]*deform_direction[None,:]
 
         patch_stats.append({
             "id":int(pid),
@@ -1103,11 +1399,24 @@ def texture_refined_mesh(vertices,faces,labels,patch_by_id,cfg,rng):
             "max_depth_actual":float(depths.max()) if len(depths) else 0.,
             "mean_depth":float(depths.mean()) if len(depths) else 0.,
             "features":{k:len(v) for k,v in ev.items()},
+            "thickness_protection":thickness_stats,
         })
 
+        tmsg=""
+        if (
+            thickness_stats["protected_vertices"]
+            or thickness_stats["clamped_vertices"]
+            or thickness_stats.get("opposing_textured_hits", 0)
+        ):
+            tmsg=(
+                f", thin protected {thickness_stats['protected_vertices']:,}"
+                f", clamped {thickness_stats['clamped_vertices']:,}"
+                f", two-sided checks {thickness_stats.get('opposing_textured_hits', 0):,}"
+            )
         print(
             f"  patch {seq}/{len(patch_by_id)} ID={pid}: "
             f"{len(face_idx):,} tris, max depth {patch_stats[-1]['max_depth_actual']:.3f} mm"
+            f"{tmsg}"
         )
 
     return out,patch_stats
@@ -1155,6 +1464,12 @@ def print_analysis(mesh,patches,eligible,cfg,max_edge):
         if skipped:
             print(f"Detected bottom Z:     {min(p.get('plane_z',0.0) for p in skipped):.3f} mm")
     print(f"Actual max edge:       {max_edge:.3f} mm")
+    print(f"Thin-wall protection:  {cfg.min_wall_thickness > 0}")
+    if cfg.min_wall_thickness > 0:
+        print(f"Minimum final wall:    {cfg.min_wall_thickness:g} mm")
+        print(f"Thickness safety:      {cfg.thickness_safety:g} mm")
+        print(f"Thickness behavior:    {cfg.thickness_mode}")
+        print(f"Thickness probe max:   {cfg.thickness_probe_max:g} mm")
     if max_edge>cfg.surface_resolution+1e-6:
         print(f"  (raised from requested {cfg.surface_resolution:g} mm to respect triangle budget)")
     print()
@@ -1217,6 +1532,10 @@ def main():
 
     rng=random.Random(cfg.seed)
 
+    if cfg.min_wall_thickness > 0:
+        print("\nPreparing thin-wall thickness ray index...")
+    thickness_intersector = build_thickness_intersector(mesh, cfg)
+
     # Label original faces with their eligible planar patch ID.
     labels=np.full(len(mesh.faces),-1,dtype=np.int64)
     patch_by_id={}
@@ -1226,6 +1545,7 @@ def main():
         patch_by_id[pid]=pinfo
 
     t0=time.time()
+    source_face_labels = labels.copy()
     target_total=len(mesh.faces)+cfg.max_new_triangles
 
     print("\nConforming local refinement...")
@@ -1240,7 +1560,7 @@ def main():
 
     print("\nApplying procedural damage...")
     dv,patch_stats=texture_refined_mesh(
-        rv,rf,rl,patch_by_id,cfg,rng
+        rv,rf,rl,patch_by_id,cfg,rng,mesh,thickness_intersector,source_face_labels
     )
 
     out=trimesh.Trimesh(vertices=dv,faces=rf,process=False)
@@ -1263,8 +1583,25 @@ def main():
     print(f"Output triangles:      {len(out.faces):,}")
     print(f"Output vertices:       {len(out.vertices):,}")
     print(f"Output watertight:     {out.is_watertight}")
+    total_thin_protected=sum(
+        s.get("thickness_protection",{}).get("protected_vertices",0)
+        for s in patch_stats
+    )
+    total_thin_clamped=sum(
+        s.get("thickness_protection",{}).get("clamped_vertices",0)
+        for s in patch_stats
+    )
+    total_two_sided=sum(
+        s.get("thickness_protection",{}).get("opposing_textured_hits",0)
+        for s in patch_stats
+    )
     print(f"Maximum dent depth:    {moved_max:.3f} mm")
     print(f"Mean textured depth:   {moved_mean:.3f} mm")
+    if cfg.min_wall_thickness > 0:
+        print(f"Thin vertices skipped: {total_thin_protected:,}")
+        if cfg.thickness_mode=="clamp":
+            print(f"Thin vertices clamped: {total_thin_clamped:,}")
+        print(f"Two-sided wall checks: {total_two_sided:,}")
     print(f"Seed:                  {cfg.seed}")
     print(f"Time:                  {time.time()-t0:.1f}s")
 
